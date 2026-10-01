@@ -384,8 +384,19 @@ class NetboxBranchGuardMiddleware:
                         # Find existing objects being modified
                         pks = []
                         pk = resolver_match.kwargs.get("pk") if resolver_match else None
+                        is_bulk_edit = not pk and not (
+                            request.content_type == "application/json" or request.path_info.startswith("/api/")
+                        )
+                        nullified_fields = set()
+
                         if pk:
                             pks = [pk]
+                        elif is_bulk_edit:
+                            # Bulk edit UI form: 'pk' is submitted once per selected object.
+                            # request.POST.dict() silently collapses that to the last value,
+                            # so pull the full list straight from the QueryDict.
+                            pks = request.POST.getlist('pk') or request.POST.getlist('id')
+                            nullified_fields = set(request.POST.getlist('_nullify'))
                         else:
                             pk_list = submitted_data.get('pk') or submitted_data.get('id')
                             if pk_list:
@@ -413,6 +424,14 @@ class NetboxBranchGuardMiddleware:
 
                                 # Check each field in submitted data
                                 for field_name, val in submitted_data.items():
+                                    if is_bulk_edit and field_name not in nullified_fields:
+                                        # NetBox's bulk-edit form POSTs every field, but a blank
+                                        # value there means "leave untouched", not "clear it"
+                                        # (NetBox itself only applies fields in form.changed_data,
+                                        # or ones explicitly checked via _nullify).
+                                        if val is None or val == "" or val == []:
+                                            continue
+
                                     if field_name.startswith('cf_'):
                                         cf_name = field_name[3:]
                                         if field_name.lower() in self.excluded_fields or cf_name.lower() in self.excluded_fields or 'custom_fields' in self.excluded_fields:
