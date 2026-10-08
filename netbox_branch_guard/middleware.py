@@ -363,9 +363,24 @@ class NetboxBranchGuardMiddleware:
                 if model_exempt:
                     return self.get_response(request)
 
+                # Deletions remove the whole object, so "only excluded fields
+                # changed" never applies to them - a delete request/view carries
+                # no field values to compare, which would otherwise make the
+                # excluded_fields check below wrongly treat every delete as exempt.
+                is_delete_request = request.method == "DELETE" or (
+                    resolver_match
+                    and str(getattr(resolver_match, "url_name", "") or "").endswith(
+                        ("_delete", "_bulk_delete")
+                    )
+                )
+
                 # 2. Check if only excluded fields are modified
                 fields_exempt = False
-                if model:
+                if is_delete_request:
+                    block_reasons.append(
+                        "Delete operations are never exempt via excluded_fields"
+                    )
+                elif model:
                     if self.excluded_fields:
                         # Get submitted data
                         submitted_data = {}
