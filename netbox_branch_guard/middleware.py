@@ -57,6 +57,20 @@ def _is_field_changed(obj, field, submitted_value):
             curr_list = [str(current_val)] if current_val is not None else []
         return sub_list != curr_list
 
+    # Boolean fields: an HTML checkbox submits the literal string "on" when
+    # checked (and is omitted entirely, not "off", when unchecked) - neither
+    # matches Python's True/False, so compare them as booleans instead of
+    # falling through to the generic string normalization below.
+    if isinstance(current_val, bool):
+        def to_bool(v):
+            if isinstance(v, bool):
+                return v
+            if not v:
+                return False
+            return str(v).strip().lower() in ("on", "true", "1", "yes")
+
+        return to_bool(current_val) != to_bool(submitted_value)
+
     # Compare string representations to avoid type mismatch issues
     # Also normalize None / empty string / False
     def normalize(v):
