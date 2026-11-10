@@ -197,6 +197,93 @@ class NetboxBranchGuardMiddleware:
 
 
 
+    def _resolve_model(self, request, log):
+        """
+        Resolve the model (if any) targeted by this request's view, via the view's
+        queryset/model attribute or, failing that, view_model_map.
+
+        Returns (model, resolver_match, block_reasons). model is None if it could not
+        be determined; block_reasons explains why, for use in a block message.
+        """
+        model = None
+        resolver_match = None
+        block_reasons = []
+        try:
+            resolver_match = resolve(request.path_info)
+        except Exception as e:
+            block_reasons.append(f"URL resolve failed: {e}")
+            log.warning(f"[BranchGuard BLOCK] URL resolve failed: {e}")
+
+        if resolver_match:
+            view_func = resolver_match.func
+            view_class = getattr(view_func, 'view_class', getattr(view_func, 'cls', None))
+            queryset = None
+            if view_class:
+                queryset = getattr(view_class, 'queryset', None)
+                if queryset is not None and hasattr(queryset, 'model'):
+                    model = queryset.model
+                else:
+                    model = getattr(view_class, 'model', None)
+
+            log.debug(
+                f"[BranchGuard DEBUG] "
+                f"resolver_match={resolver_match}, "
+                f"view_func={view_func}, "
+                f"view_class={view_class}, "
+                f"queryset={queryset}, "
+                f"model={model} "
+            )
+
+            # Initialize the variables to avoid errors when debugging and the view_model_map isn't defined
+            mapped_model = None
+            module_name = None
+            module = None
+
+            # If we can't determine the model, then see if there is a mapping in the view_model_map
+            if model is None and view_class:
+                view_name = (
+                    f"{view_class.__module__}."
+                    f"{view_class.__name__}"
+                )
+
+                mapped_model = self.view_model_map.get(view_name)
+
+                if mapped_model:
+                    module_name, class_name = mapped_model.rsplit('.', 1)
+                    module = importlib.import_module(module_name)
+                    model = getattr(module, class_name)
+
+                log.debug(
+                    f"[BranchGuard DEBUG] "
+                    f"view_name={view_name}, "
+                    f"mapped_model={mapped_model}, "
+                    f"module_name={module_name}, "
+                    f"module={module}, "
+                    f"model={model} "
+                )
+        else:
+            block_reasons.append("Could not resolve path to a view")
+
+        return model, resolver_match, block_reasons
+
+    def _model_opts_out_of_branching(self, model):
+        """
+        True if `model` is permanently excluded from netbox_branching's schema isolation
+        (e.g. users.User, or anything under EXEMPT_MODELS / core.*). Writes to such models
+        always land directly in Main - there is no branch-local copy for them to route into,
+        whether or not a branch is active - so the "writes must go through a branch" workflow
+        this middleware enforces is meaningless for them. Mirrors the model_exempt check for
+        this plugin's own `netbox_branching.*` models just below.
+        """
+        if model is None:
+            return False
+        try:
+            from netbox_branching.utilities import supports_branching
+        except Exception:
+            # netbox_branching isn't installed/loaded - nothing to defer to.
+            return False
+        return not supports_branching(model)
+
     def __call__(self, request):
 
         # Enable logging
@@ -281,64 +368,7 @@ class NetboxBranchGuardMiddleware:
                 )
 
                 # Check if this write to main is exempt under excluded_models or excluded_fields
-                model = None
-                resolver_match = None
-                block_reasons = []
-                try:
-                    resolver_match = resolve(request.path_info)
-                except Exception as e:
-                    block_reasons.append(f"URL resolve failed: {e}")
-                    log.warning(f"[BranchGuard BLOCK] URL resolve failed: {e}")
-
-                if resolver_match:
-                    view_func = resolver_match.func
-                    view_class = getattr(view_func, 'view_class', getattr(view_func, 'cls', None))
-                    if view_class:
-                        queryset = getattr(view_class, 'queryset', None)
-                        if queryset is not None and hasattr(queryset, 'model'):
-                            model = queryset.model
-                        else:
-                            model = getattr(view_class, 'model', None)
-
-                    log.debug(
-                        f"[BranchGuard DEBUG] "
-                        f"resolver_match={resolver_match}, "
-                        f"view_func={view_func}, "
-                        f"view_class={view_class}, "
-                        f"queryset={queryset}, "
-                        f"model={model} "
-                    )
-
-                    # Initialize the variables to avoid errors when debugging and the view_model_map isn't defined
-                    mapped_model = None
-                    module_name = None
-                    module = None
-
-                    # If we can't determine the model, then see if there is a mapping in the view_model_map
-                    if model is None and view_class:
-                        view_name = (
-                            f"{view_class.__module__}."
-                            f"{view_class.__name__}"
-                        )
-
-                        mapped_model = self.view_model_map.get(view_name)
-
-                        if mapped_model:
-                            module_name, class_name = mapped_model.rsplit('.', 1)
-                            module = importlib.import_module(module_name)
-                            model = getattr(module, class_name)
-
-                        log.debug(
-                            f"[BranchGuard DEBUG] "
-                            f"view_name={view_name}, "
-                            f"mapped_model={mapped_model}, "
-                            f"module_name={module_name}, "
-                            f"module={module}, "
-                            f"model={model} "
-                        )
-                else:
-                    block_reasons.append("Could not resolve path to a view")
-
+                model, resolver_match, block_reasons = self._resolve_model(request, log)
 
                 # 1. Check if model itself is exempt
                 model_exempt = False
@@ -355,7 +385,12 @@ class NetboxBranchGuardMiddleware:
                         f"model_path={model_path} "
                     )
 
-                    if model_label in self.excluded_models or model_path in self.excluded_models or model._meta.app_label == 'netbox_branching':
+                    if (
+                        model_label in self.excluded_models
+                        or model_path in self.excluded_models
+                        or model._meta.app_label == 'netbox_branching'
+                        or self._model_opts_out_of_branching(model)
+                    ):
                         model_exempt = True
                 else:
                     block_reasons.append("No model resolved for path")
@@ -524,6 +559,17 @@ class NetboxBranchGuardMiddleware:
                 # Redirect the user back to the previous page
                 return redirect(request.META.get("HTTP_REFERER", "/"))
 
+
+            # Writes to models that don't support branching (e.g. users.User, or anything
+            # under netbox_branching's EXEMPT_MODELS) always land directly in Main - there's
+            # no branch-local copy for them to route into, regardless of which branch is
+            # "active" in the cookie/session. Treat them the same as the Main-context
+            # model_exempt check above: there's no "write through a branch" workflow to
+            # enforce for them, so let the request through rather than silently allowing a
+            # write that looks branch-scoped but isn't.
+            model, _, _ = self._resolve_model(request, log)
+            if self._model_opts_out_of_branching(model):
+                return self.get_response(request)
 
             # Lazy import
             try:
