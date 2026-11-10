@@ -197,6 +197,110 @@ class NetboxBranchGuardMiddleware:
 
 
 
+    def _resolve_model(self, request, log):
+        """
+        Resolve the model (if any) targeted by this request's view, via the view's
+        queryset/model attribute or, failing that, view_model_map.
+
+        Returns (model, resolver_match, block_reasons). model is None if it could not
+        be determined; block_reasons explains why, for use in a block message.
+        """
+        model = None
+        resolver_match = None
+        block_reasons = []
+        try:
+            resolver_match = resolve(request.path_info)
+        except Exception as e:
+            block_reasons.append(f"URL resolve failed: {e}")
+            log.warning(f"[BranchGuard BLOCK] URL resolve failed: {e}")
+
+        if resolver_match:
+            view_func = resolver_match.func
+            view_class = getattr(view_func, 'view_class', getattr(view_func, 'cls', None))
+            queryset = None
+            if view_class:
+                queryset = getattr(view_class, 'queryset', None)
+                if queryset is not None and hasattr(queryset, 'model'):
+                    model = queryset.model
+                else:
+                    model = getattr(view_class, 'model', None)
+
+            log.debug(
+                f"[BranchGuard DEBUG] "
+                f"resolver_match={resolver_match}, "
+                f"view_func={view_func}, "
+                f"view_class={view_class}, "
+                f"queryset={queryset}, "
+                f"model={model} "
+            )
+
+            # Initialize the variables to avoid errors when debugging and the view_model_map isn't defined
+            mapped_model = None
+            module_name = None
+            module = None
+
+            # If we can't determine the model, then see if there is a mapping in the view_model_map
+            if model is None and view_class:
+                view_name = (
+                    f"{view_class.__module__}."
+                    f"{view_class.__name__}"
+                )
+
+                mapped_model = self.view_model_map.get(view_name)
+
+                if mapped_model:
+                    module_name, class_name = mapped_model.rsplit('.', 1)
+                    module = importlib.import_module(module_name)
+                    model = getattr(module, class_name)
+
+                log.debug(
+                    f"[BranchGuard DEBUG] "
+                    f"view_name={view_name}, "
+                    f"mapped_model={mapped_model}, "
+                    f"module_name={module_name}, "
+                    f"module={module}, "
+                    f"model={model} "
+                )
+        else:
+            block_reasons.append("Could not resolve path to a view")
+
+        return model, resolver_match, block_reasons
+
+    def _model_opts_out_of_branching(self, model):
+        """
+        True if `model` is permanently excluded from netbox_branching's schema isolation
+        (e.g. users.User, or anything under EXEMPT_MODELS / core.*). Writes to such models
+        always land directly in Main - there is no branch-local copy for them to route into,
+        whether or not a branch is active - so the "writes must go through a branch" workflow
+        this middleware enforces is meaningless for them. Mirrors the model_exempt check for
+        this plugin's own `netbox_branching.*` models just below.
+        """
+        if model is None:
+            return False
+        try:
+            from netbox_branching.utilities import supports_branching
+        except Exception:
+            # netbox_branching isn't installed/loaded - nothing to defer to.
+            return False
+        return not supports_branching(model)
+
+    @staticmethod
+    def _blocked_response(request, message):
+        """
+        Build the response for a blocked write. API requests get a JSON 403 they
+        can actually handle; browser/UI requests get redirected back to where
+        they came from (the flash message explaining why was already queued via
+        the `log` wrapper at the call site).
+
+        Redirecting an API request isn't safe: browsers preserve the method on
+        301/302/307/308 per the fetch spec, so the client just resends e.g. a
+        PATCH at the Referer URL - usually a GET-only UI endpoint - producing a
+        confusing 405 instead of a response the API client can actually handle.
+        """
+        if request.path.startswith("/api/"):
+            return JsonResponse({"detail": message}, status=403)
+        return redirect(request.META.get("HTTP_REFERER", "/"))
+
     def __call__(self, request):
 
         # Enable logging
@@ -281,64 +385,7 @@ class NetboxBranchGuardMiddleware:
                 )
 
                 # Check if this write to main is exempt under excluded_models or excluded_fields
-                model = None
-                resolver_match = None
-                block_reasons = []
-                try:
-                    resolver_match = resolve(request.path_info)
-                except Exception as e:
-                    block_reasons.append(f"URL resolve failed: {e}")
-                    log.warning(f"[BranchGuard BLOCK] URL resolve failed: {e}")
-
-                if resolver_match:
-                    view_func = resolver_match.func
-                    view_class = getattr(view_func, 'view_class', getattr(view_func, 'cls', None))
-                    if view_class:
-                        queryset = getattr(view_class, 'queryset', None)
-                        if queryset is not None and hasattr(queryset, 'model'):
-                            model = queryset.model
-                        else:
-                            model = getattr(view_class, 'model', None)
-
-                    log.debug(
-                        f"[BranchGuard DEBUG] "
-                        f"resolver_match={resolver_match}, "
-                        f"view_func={view_func}, "
-                        f"view_class={view_class}, "
-                        f"queryset={queryset}, "
-                        f"model={model} "
-                    )
-
-                    # Initialize the variables to avoid errors when debugging and the view_model_map isn't defined
-                    mapped_model = None
-                    module_name = None
-                    module = None
-
-                    # If we can't determine the model, then see if there is a mapping in the view_model_map
-                    if model is None and view_class:
-                        view_name = (
-                            f"{view_class.__module__}."
-                            f"{view_class.__name__}"
-                        )
-
-                        mapped_model = self.view_model_map.get(view_name)
-
-                        if mapped_model:
-                            module_name, class_name = mapped_model.rsplit('.', 1)
-                            module = importlib.import_module(module_name)
-                            model = getattr(module, class_name)
-
-                        log.debug(
-                            f"[BranchGuard DEBUG] "
-                            f"view_name={view_name}, "
-                            f"mapped_model={mapped_model}, "
-                            f"module_name={module_name}, "
-                            f"module={module}, "
-                            f"model={model} "
-                        )
-                else:
-                    block_reasons.append("Could not resolve path to a view")
-
+                model, resolver_match, block_reasons = self._resolve_model(request, log)
 
                 # 1. Check if model itself is exempt
                 model_exempt = False
@@ -355,10 +402,28 @@ class NetboxBranchGuardMiddleware:
                         f"model_path={model_path} "
                     )
 
-                    if model_label in self.excluded_models or model_path in self.excluded_models or model._meta.app_label == 'netbox_branching':
+                    if (
+                        model_label in self.excluded_models
+                        or model_path in self.excluded_models
+                        or model._meta.app_label == 'netbox_branching'
+                        or self._model_opts_out_of_branching(model)
+                    ):
                         model_exempt = True
                 else:
-                    block_reasons.append("No model resolved for path")
+                    # We can't tell which model this write targets (e.g. a ViewSet with no
+                    # queryset/model attribute and no view_model_map entry, like NetBox's
+                    # own UserConfigViewSet). Every write that actually needs branch
+                    # enforcement goes through a NetBox-generated view backed by a
+                    # queryset - which _resolve_model() already handles - so a write we
+                    # can't identify at all is, in practice, something else entirely (a
+                    # per-user config/preference endpoint, a custom action, ...) rather
+                    # than a branchable write hiding from us. Blocking by default here
+                    # breaks that unrelated functionality outright, with no way to recover
+                    # short of adding every such view to view_model_map by hand - so fail
+                    # open instead. view_model_map remains available for the rare view
+                    # that genuinely does need enforcement despite exposing no model.
+                    log.debug(f"[BranchGuard ALLOW] No model resolved for {request.path} - allowing by default")
+                    model_exempt = True
 
                 if model_exempt:
                     return self.get_response(request)
@@ -508,22 +573,24 @@ class NetboxBranchGuardMiddleware:
                 reason_str = "; ".join(block_reasons) if block_reasons else "restricted write operation"
                 display_msg = f"Writes to the Main branch are restricted ({reason_str})"
 
-                if request.path.startswith("/api/"):
-                    # Block writes to Main by the /api/
-                    log.warning(
-                        f"[BranchGuard BLOCK] Blocking writes to Main. Reason: {reason_str}",
-                        display_msg
-                    )
-                else:
-                    # Block writes to Main in the UI
-                    log.warning(
-                        f"[BranchGuard BLOCK] Blocking writes to Main. Reason: {reason_str}",
-                        display_msg
-                    )
+                log.warning(
+                    f"[BranchGuard BLOCK] Blocking writes to Main. Reason: {reason_str}",
+                    display_msg
+                )
 
-                # Redirect the user back to the previous page
-                return redirect(request.META.get("HTTP_REFERER", "/"))
+                return self._blocked_response(request, display_msg)
 
+
+            # Writes to models that don't support branching (e.g. users.User, or anything
+            # under netbox_branching's EXEMPT_MODELS) always land directly in Main - there's
+            # no branch-local copy for them to route into, regardless of which branch is
+            # "active" in the cookie/session. Treat them the same as the Main-context
+            # model_exempt check above: there's no "write through a branch" workflow to
+            # enforce for them, so let the request through rather than silently allowing a
+            # write that looks branch-scoped but isn't.
+            model, _, _ = self._resolve_model(request, log)
+            if self._model_opts_out_of_branching(model):
+                return self.get_response(request)
 
             # Lazy import
             try:
@@ -532,8 +599,7 @@ class NetboxBranchGuardMiddleware:
             except Exception as e:
                 log.error(f"[BranchGuardi ERROR] Branch import failed: {e}")
 
-                # Redirect the user back to the previous page
-                return redirect(request.META.get("HTTP_REFERER", "/"))
+                return self._blocked_response(request, f"Branch import failed: {e}")
 
 
             # Validate branch
@@ -543,14 +609,12 @@ class NetboxBranchGuardMiddleware:
             except Branch.DoesNotExist:
                 log.error(f"[BranchGuard ERROR] Invalid branch")
 
-                # Redirect the user back to the previous page
-                return redirect(request.META.get("HTTP_REFERER", "/"))
+                return self._blocked_response(request, "Invalid branch")
 
             except Exception as e:
                 log.error(f"[BranchGuard ERROR] DB error: {e}")
 
-                # Redirect the user back to the previous page
-                return redirect(request.META.get("HTTP_REFERER", "/"))
+                return self._blocked_response(request, f"DB error: {e}")
 
 
             # Check for allowed branches
@@ -564,15 +628,13 @@ class NetboxBranchGuardMiddleware:
                 if not allowed_branch_patterns:
                     log.warning(f"[BranchGuard BLOCK] You are not assigned to a branch group")
 
-                    # Redirect the user back to the previous page
-                    return redirect(request.META.get("HTTP_REFERER", "/"))
+                    return self._blocked_response(request, "You are not assigned to a branch group")
 
                 if not any(fnmatch.fnmatch(branch.name, pattern) for pattern in allowed_branch_patterns):
                     log.warning(f'[BranchGuard BLOCK] You cannot use branch "{branch.name}"')
                     log.warning(f"[BranchGuard BLOCK] Only: {', '.join('"' + b +'"' for b in allowed_branch_patterns)}")
 
-                    # Redirect the user back to the previous page
-                    return redirect(request.META.get("HTTP_REFERER", "/"))
+                    return self._blocked_response(request, f'You cannot use branch "{branch.name}"')
 
 
             # Ownership enforcement
@@ -583,8 +645,7 @@ class NetboxBranchGuardMiddleware:
                     f"You can only modify a branch you own"
                 )
 
-                # Redirect the user back to the previous page
-                return redirect(request.META.get("HTTP_REFERER", "/"))
+                return self._blocked_response(request, "You can only modify a branch you own")
 
             log.success(
                 f"[BranchGuard ALLOW] user={request.user}, "
@@ -596,8 +657,7 @@ class NetboxBranchGuardMiddleware:
         except Exception as e:
             log.error(f"[BranchGuard ERROR] {e}")
 
-            # Redirect the user back to the previous page
-            return redirect(request.META.get("HTTP_REFERER", "/"))
+            return self._blocked_response(request, str(e))
 
 
         return self.get_response(request)
