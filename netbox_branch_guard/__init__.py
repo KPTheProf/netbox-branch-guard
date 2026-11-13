@@ -20,7 +20,7 @@ class NetboxBranchGuardConfig(PluginConfig):
     base_url = "branch-guard"
 
     min_version = "4.6.0"
-    max_version = "4.6.99"
+    max_version = "4.7.99"
 
     middleware = (
         "netbox_branch_guard.middleware.NetboxBranchGuardMiddleware",
